@@ -57,68 +57,9 @@ python eval_adv.py \
   model.device=cuda:0
 ```
 
-For parallel execution with multiple GPUs, see [SPLIT_WORKFLOW.md](SPLIT_WORKFLOW.md).
-
-## 🔧 Configuration
-
-Edit `config/*.yaml` files to customize:
-- `mask_ratio_by_cluster`: Perturbation magnitude per stage
-- `lambda_attn_by_cluster`: Attention loss weight
-- `lambda_rel`: Relation loss weight
-- `optim.steps`: Optimization iterations (default: 300)
-- `optim.alpha`: Step size
-
-## 📊 Parallel Processing Example
-
-Run 8 concurrent processes across 4 GPUs:
-
-```bash
-# Process 1-8 with different sample ranges and GPU assignments
-for i in {0..7}; do
-  nohup python generate_adv_stages.py \
-    --sample-start $((i*125)) --sample-end $(((i+1)*125)) \
-    model.device=cuda:$((i%4)) \
-    > gen_adv_p$((i+1)).log 2>&1 &
-done
-```
-
-## 📁 Output Structure
-
-```
-results_1000/
-└── TIMESTAMP_DFRA_attack_only_1000/
-    ├── stage1/          # Stage 3 generated images
-    │   ├── 0/
-    │   │   ├── 0.png
-    │   │   └── ...
-    │   └── ...
-    ├── stage2/          # Stage 5 generated images
-    │   └── ...
-    ├── attack_manifest.json  # Metadata and tracking
-    └── (code snapshots)
-```
-
-## 🎯 Attack Methods
-
-Supported optimization algorithms:
-- **FGSM**: Fast Gradient Sign Method
-- **MI-FGSM**: Momentum Iterative FGSM
-- **PGD**: Projected Gradient Descent
 
 ## 💖 Acknowledgements
 
 This project is built upon [M-Attack](https://github.com/VILA-Lab/M-Attack) . We thank the authors for their foundational work.
 
-## 📝 Citation
-
-If you use DFRA-Attack in your research, please cite:
-
-```bibtex
-@article{dfra-attack-2025,
-  title={DFRA-Attack: Defense-aware Feature Relation Alignment for Adversarial Attacks},
-  author={Your Name},
-  journal={arXiv preprint},
-  year={2025}
-}
-```
 
