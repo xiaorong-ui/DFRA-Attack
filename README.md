@@ -107,7 +107,7 @@ Supported optimization algorithms:
 
 ## 💖 Acknowledgements
 
-This project is built upon [M-Attack](https://github.com/VILA-Lab/M-Attack) and [FOA-Attack](https://github.com/PKU-YuanGroup/FOA-Attack). We thank the authors for their foundational work.
+This project is built upon [M-Attack](https://github.com/VILA-Lab/M-Attack) . We thank the authors for their foundational work.
 
 ## 📝 Citation
 
