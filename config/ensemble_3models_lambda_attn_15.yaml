@@ -1,0 +1,46 @@
+defaults:
+  - _self_
+
+data:
+  batch_size: 1
+  num_samples: 100
+  sample_mode: "interval"
+  output: "./results_ablation"
+  method: "DFRA_attn_0.15"
+  cle_data_path: "resources/images/bigscale_1000"
+  tgt_data_path: "resources/images/target_images_1000"
+
+optim:
+  alpha: 1.0
+  epsilon: 16
+  steps: 300
+
+model:
+  input_res: 224
+  use_source_crop: true
+  use_target_crop: true
+  crop_scale: [0.5, 0.9]
+  ensemble: true
+  device: "cuda:0"
+  backbone: ["B16", "B32", "Laion"]
+
+dfra_attack:
+  cluster_sequence: [3, 5]
+  mask_ratio_by_cluster:
+    3: 0.10
+    5: 0.10
+  lambda_attn_by_cluster:
+    3: 0.15
+    5: 0.15
+  lambda_rel: 0.50
+  use_random_erasing: true
+  use_saliency_mask: true
+  mask_off_steps: 200
+
+blackbox:
+  model_name:
+    - "gemini"
+  batch_size: 1
+  timeout: 30
+
+attack: "fgsm"
