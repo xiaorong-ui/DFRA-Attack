@@ -34,36 +34,6 @@ def get_cluster_center(embedding_img: Tensor, num_cluster=5) -> Tensor:
         )
     return cluster_center
 
-def OT(src_dis, tgt_dis):
-    src_dis_norm = F.normalize(src_dis, dim=1)
-    tgt_dis_norm = F.normalize(tgt_dis, dim=1)
-    sim = torch.einsum("md,nd->mn", src_dis_norm, tgt_dis_norm).contiguous()
-    wdist = 1 - sim
-    xx = torch.full((src_dis.shape[0],), 1.0 / src_dis.shape[0], dtype=sim.dtype, device=sim.device)
-    yy = torch.full((tgt_dis.shape[0],), 1.0 / tgt_dis.shape[0], dtype=sim.dtype, device=sim.device)
-    with torch.no_grad():
-        KK = torch.exp(-wdist / 0.1)
-        T = Sinkhorn(KK, xx, yy)
-    if torch.isnan(T).any():
-        return None
-    sim_op = torch.sum(T * sim, dim=(0, 1))
-    loss = torch.sum(sim_op)
-    return loss
-
-def Sinkhorn(K, u, v):
-    r = torch.ones_like(u)
-    c = torch.ones_like(v)
-    thresh = 1e-2
-    for _ in range(100):
-        r0 = r
-        r = u / (K @ c.unsqueeze(-1)).squeeze(-1)
-        c = v / (K.t() @ r.unsqueeze(-1)).squeeze(-1)
-        err = (r - r0).abs().mean()
-        if err.item() < thresh:
-            break
-    T = torch.outer(r, c) * K
-    return T
-
 class BaseFeatureExtractor(nn.Module):
     def __init__(self):
         super(BaseFeatureExtractor, self).__init__()
@@ -155,66 +125,6 @@ class EnsembleFeatureLoss(nn.Module):
 
         return loss
 
-class EnsembleExtractor_global(BaseFeatureExtractor):
-    def __init__(self, extractors: List[BaseFeatureExtractor]):
-        super(EnsembleExtractor_global, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-
-    def forward(self, x: Tensor):
-        features = []
-        for model in self.extractors:
-            global_feature = model.global_features(x)
-            features.append(global_feature.squeeze())
-        return features,
-
-class EnsembleLoss_global(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor]):
-        super(EnsembleLoss_global, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.previous_loss_list = []
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        for model in self.extractors:
-            x_tensor = model.global_features(x)
-            self.ground_truth.append(x_tensor)
-
-    def __call__(self, features: List[Tensor]):
-        loss_list = []
-        for index in range(len(self.extractors)):
-            gt = self.ground_truth[index]
-            feature = features[index].unsqueeze(0)
-
-            feat_loss = OT(gt, feature)
-            loss_list.append(feat_loss)
-
-        total_losses = [loss_list[i] for i in range(len(self.extractors))]
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
 class EnsembleFeatureExtractor_ot(BaseFeatureExtractor):
     def __init__(self, extractors: List[BaseFeatureExtractor],cluster_number=5):
         super(EnsembleFeatureExtractor_ot, self).__init__()
@@ -273,68 +183,9 @@ class EnsembleFeatureLoss_OT(nn.Module):
         loss = loss + loss_local * 0.1
         return loss
 
-class EnsembleFeatureLoss_OT_Auto(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor]):
-        super(EnsembleFeatureLoss_OT_Auto, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        for model in self.extractors:
-            x_tensor, x_embedding = model.global_local_features(x.to(x.device))
-            x_embedding = x_embedding.squeeze(0)
-            cluster_center = get_cluster_center(x_embedding).unsqueeze(0)
-            self.ground_truth.append(x_tensor)
-            self.ground_truth_local.append(cluster_center)
-
-    def __call__(self, features: List[Tensor], features_local: List[Tensor]):
-        loss_list = []
-        loss_local_list = []
-        for index, model in enumerate(self.extractors):
-            gt_local = self.ground_truth_local[index].squeeze(0)
-            gt = self.ground_truth[index]
-            feature = features[index]
-            feature_local = features_local[index].squeeze(0)
-            local_loss = OT(gt_local, feature_local) * 2
-            feat_loss = torch.mean(torch.sum(feature * gt, dim=1))
-
-            loss_list.append(feat_loss)
-            loss_local_list.append(local_loss)
-
-        total_losses = [
-            loss_list[i] + 0.1 * loss_local_list[i]
-            for i in range(len(self.extractors))
-        ]
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K    
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
-
+# ========================================================
+# 全局最优传输 (Optimal Transport) 距离计算函数
+# ========================================================
 def Sinkhorn(K, u, v):
     # 这里给 Sinkhorn 补上数值稳定性保护。
     # 之前直接做除法：
@@ -441,495 +292,479 @@ def OT(src_dis, tgt_dis):
 
 
 
-
-
-# ========================================================
-class EnsembleFeatureExtractor_middle(BaseFeatureExtractor):
-    def __init__(self, extractors: List[BaseFeatureExtractor], cluster_number=5):
-        super(EnsembleFeatureExtractor_middle, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.cluster_number = cluster_number
-
-    def forward(self, x: Tensor) -> Tensor:
-        features = {}
-        features_local = {}
-
-        features_global_middle = {}
-        features_local_middle = {}
-        for i, model in enumerate(self.extractors):
-            x_tensor, x_embedding, middle_tensor, middle_embedding = model.global_local_middle_features(x.to(x.device))
-            features[i] = x_tensor.squeeze()
-            cluster_center = get_cluster_center(x_embedding[0], self.cluster_number).unsqueeze(0)
-            features_local[i] = cluster_center
-
-            features_global_middle[i] = middle_tensor.squeeze()
-            cluster_middle_center = get_cluster_center(middle_embedding[0], self.cluster_number).unsqueeze(0)
-            features_local_middle[i] = cluster_middle_center
-
-        return features, features_local, features_global_middle, features_local_middle
-
-class EnsembleFeatureLoss_OT_dfra_attack_middle(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor],cluster_number=5):
-        super(EnsembleFeatureLoss_OT_dfra_attack_middle, self).__init__()
+import math
+class EnsembleFeatureLoss_OT_dfra_attack(nn.Module):
+    # 这里将 erasing_prob 保持为 1.0：
+    # - 当前方法使用的是“shared top-k saliency mask”，不是普通随机擦除；
+    # - 如果每个 step 只偶尔启用 mask，会让优化目标在 masked / unmasked 视图之间来回切换，
+    #   不利于稳定地学习局部对齐。
+    # 同时把默认 erasing_scale 调低到 0.12：
+    # - 因为当前 mask 的是三个 CLIP 共同最关注的区域，破坏力比随机遮挡更强；
+    # - 0.12 在 14x14 公共网格上大约对应 24 个 patch，通常比 0.15 更稳妥。
+    def __init__(
+        self,
+        extractors,
+        cluster_number=5,
+        use_random_erasing=True,
+        erasing_prob=1.0,
+        erasing_scale=(0.20, 0.20),
+        use_saliency_mask=True,
+        lambda_attn=0.1,
+        lambda_rel=0.5,
+        use_mask=True,
+    ):
+        super(EnsembleFeatureLoss_OT_dfra_attack, self).__init__()
         self.extractors = nn.ModuleList(extractors)
         self.ground_truth = []
         self.ground_truth_local = []
-        self.previous_loss_list=[]
+        self.ground_truth_attention = []
+        self.previous_loss_list = []
         self.previous_loss_local_list = []
         self.cluster_number = cluster_number
-        self.ground_truth_middle = []
-        self.ground_truth_local_middle = []
+
+        # 掩码参数
+        self.use_random_erasing = use_random_erasing if use_mask else False
+        # self.use_random_erasing = False  # 消融实验，不使用mask试试
+        self.erasing_prob = erasing_prob
+        self.erasing_scale = erasing_scale
+        self.use_saliency_mask = use_saliency_mask if use_mask else False
+        self.use_mask = use_mask
+
+        # 🔥 核心修正 0：新增对齐控制参数
+        # current_mask_indices/current_mask_grid_shape 共同描述“当前 step 的共享 mask”：
+        # 1) indices 存的是在公共空间网格上的 flat patch index；
+        # 2) grid_shape 存的是公共空间网格尺寸，例如 224 输入 + patch_size=16 -> (14, 14)。
+        # 后续 target image、adv image 以及不同 CLIP 的 local token 都必须从这同一个 mask 派生，
+        # 这样才能做到真正的 symmetric/shared masking。
+        self.current_mask_indices = []
+        self.current_mask_grid_shape = None
+        self.lambda_sem = 1.2
+        self.lambda_rel = lambda_rel
+        # 新增的 attention alignment 先给一个较小权重：
+        # - 语义 OT 和 Gram relation 仍然是主项；
+        # - attention relation 作为辅助约束，避免一开始就因为权重过大把优化拉偏。
+        self.lambda_attn = lambda_attn
+        # 当 attention 权重被显式设为 0 时，视作关闭这条辅助分支。
+        # 这样 cluster=5 就可以只保留语义 + Gram relation，而不参与 attention alignment。
+        self.use_attention_alignment = self.lambda_attn > 0
+
+        # 温度退火参数 (Temperature Annealing)
+        self.step_count = 0      # 记录当前调用的步数
+        self.T_init = 2.0        # 初始温度（降低以加快早期聚焦）
+        self.T_min = 0.5         # 最低温度（利用期）
+        self.decay_rate = 0.95   # 温度衰减率
+
+    # ================= Mask 辅助函数 =================
+    def _mask_grid_shape(self, x: Tensor, patch_size: int = 16):
+        """根据输入图像尺寸构造公共 mask 网格。
+
+        这里的公共网格用于“选区域”，不等同于每个 CLIP backbone 的真实 token 网格。
+        例如当前输入分辨率为 224，patch_size=16 时，公共 mask 网格为 14x14；
+        之后会通过 project_mask_indices_to_tokens() 投影到 B16/B32/Laion 各自的 token 网格。
+        """
+        _, _, height, width = x.shape
+        return height // patch_size, width // patch_size
+
+    def sample_patch_mask_indices(self, x: Tensor, patch_size: int = 16):
+        if random.random() > self.erasing_prob:
+            return [], self._mask_grid_shape(x, patch_size=patch_size)
+
+        _, _, height, width = x.shape
+        num_patches_h = height // patch_size
+        num_patches_w = width // patch_size
+        total_patches = num_patches_h * num_patches_w
+        num_mask = int(total_patches * random.uniform(self.erasing_scale[0], self.erasing_scale[1]))
+        if num_mask == 0:
+            return [], (num_patches_h, num_patches_w)
+
+        return random.sample(range(total_patches), num_mask), (num_patches_h, num_patches_w)
+
+    def select_saliency_mask_indices(self, x: Tensor, patch_size: int = 16):
+        if random.random() > self.erasing_prob:
+            return [], self._mask_grid_shape(x, patch_size=patch_size)
+
+        avg_saliency, var_saliency, num_patches_h, num_patches_w = self.compute_saliency_scores(x)
+        total_patches = num_patches_h * num_patches_w
+        num_mask = int(total_patches * random.uniform(self.erasing_scale[0], self.erasing_scale[1]))
+        if num_mask == 0:
+            return [], (num_patches_h, num_patches_w)
+
+        # 这里保留你要求的“mask 三个 CLIP 共同最关注区域”的设计：
+        # - avg_saliency 高：说明多个 CLIP 普遍关注该区域；
+        # - var_saliency 低：说明不同 CLIP 对该区域的关注更一致；
+        # 因此用 mean - 0.5 * variance 作为共识关注度，并严格取 top-k，而不是随机采样。
+        base_mask_weight = avg_saliency
+        consensus_mask_weight = base_mask_weight - 0.5 * var_saliency
+        consensus_mask_weight = torch.clamp(consensus_mask_weight, min=0.0)
+        num_mask = min(num_mask, total_patches)
+        _, topk_indices = torch.topk(consensus_mask_weight, k=num_mask, largest=True, sorted=False)
+        return topk_indices.cpu().tolist(), (num_patches_h, num_patches_w)
+
+    def apply_indices_mask_to_image(
+        self,
+        x: Tensor,
+        masked_patch_indices: list = None,
+        mask_grid_shape: tuple = None,
+    ):
+        """把共享 top-k mask 真实应用到图像像素上。
+
+        这一步对应 Locality Alignment / MaskEmbed 里的 masked image query：
+        teacher/encoder 看到的是 m(x)，而不是完整图像。为了避免黑块 artifact，
+        被 mask 的 patch 不填 0，而是填 CLIP 的 dataset mean（注意当前数据管线在
+        normalizer 前是 0~255，所以这里使用 mean * 255）。
+
+        Args:
+            x: 图像张量，形状通常为 [B, 3, H, W]，数值范围为 0~255。
+            masked_patch_indices: 公共 mask 网格上的 flat indices。
+            mask_grid_shape: 公共 mask 网格尺寸，例如 (14, 14)。
+        """
+        if masked_patch_indices is None:
+            masked_patch_indices = self.current_mask_indices
+        if mask_grid_shape is None:
+            mask_grid_shape = self.current_mask_grid_shape
+        if not masked_patch_indices or mask_grid_shape is None:
+            return x
+
+        x_masked = x.clone()
+        _, channels, height, width = x.shape
+        num_patches_h, num_patches_w = mask_grid_shape
+
+        # CLIP mean in RGB order. 当前输入在 normalizer 前是 0~255，因此乘 255。
+        # 如果后续数据管线改成 0~1，这里需要同步改成不乘 255。
+        fill_value = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 3, 1, 1) * 255.0
+        if channels != 3:
+            fill_value = torch.zeros((1, channels, 1, 1), dtype=x.dtype, device=x.device)
+
+        for patch_idx in masked_patch_indices:
+            patch_row = patch_idx // num_patches_w
+            patch_col = patch_idx % num_patches_w
+
+            # 用比例切分而不是固定 patch_size，确保 crop 后只要分辨率一致/接近，
+            # 同一个公共 grid index 仍然对应同一相对空间位置。
+            start_h = int(round(patch_row * height / num_patches_h))
+            end_h = int(round((patch_row + 1) * height / num_patches_h))
+            start_w = int(round(patch_col * width / num_patches_w))
+            end_w = int(round((patch_col + 1) * width / num_patches_w))
+            x_masked[:, :, start_h:end_h, start_w:end_w] = fill_value
+
+        return x_masked
+
+    def apply_current_mask_to_image(self, x: Tensor):
+        """给 attack loop 使用：把当前 target 选出的共享 mask 应用到 adv image 上。"""
+        return self.apply_indices_mask_to_image(
+            x,
+            masked_patch_indices=self.current_mask_indices,
+            mask_grid_shape=self.current_mask_grid_shape,
+        )
+
+    def apply_patch_mask_to_image(self, x: Tensor, patch_size: int = 16):
+        x_masked = x.clone()
+        _, _, height, width = x.shape
+        num_patches_h = height // patch_size
+        num_patches_w = width // patch_size
+        masked_patch_indices, mask_grid_shape = self.sample_patch_mask_indices(x, patch_size=patch_size)
+        if not masked_patch_indices:
+            return x, []
+        x_masked = self.apply_indices_mask_to_image(x, masked_patch_indices, mask_grid_shape)
+        return x_masked, masked_patch_indices
+
+    def apply_token_mask_to_embedding(self, embedding: Tensor, masked_patch_indices: list):
+        # 兼容旧逻辑的 token zeroing 函数；当前主路径已经改为 visible-only alignment，
+        # 不再直接把 token 置零，而是用 get_visible_token_indices() 只取未被 mask 的 tokens。
+        if not masked_patch_indices:
+            return embedding
+        embedding_masked = embedding.clone()
+        if embedding.dim() == 3:
+            batch_size, num_tokens, feature_dim = embedding.shape
+        else:
+            num_tokens, feature_dim = embedding.shape
+            batch_size = 1
+            embedding_masked = embedding_masked.unsqueeze(0)
+        for patch_idx in masked_patch_indices:
+            token_idx = patch_idx
+            if token_idx < num_tokens:
+                embedding_masked[:, token_idx, :] = 0
+        if embedding.dim() == 2:
+            embedding_masked = embedding_masked.squeeze(0)
+        return embedding_masked
+
+    def project_mask_indices_to_tokens(
+        self,
+        masked_patch_indices: list,
+        source_grid_shape: tuple,
+        num_tokens: int,
+        device: torch.device,
+    ):
+        """把公共 top-k mask 投影到当前 CLIP 的 local token 网格。
+
+        为什么需要这一步：
+        - B16 的 local token 网格是 14x14；
+        - B32 的 local token 网格是 7x7；
+        - Laion G-14 的 local token 网格是 16x16。
+        如果直接把 14x14 的 flat index 用到所有模型上，B32/Laion 的空间位置会错位。
+        因此先把公共 mask map resize 到当前模型的 token grid，再取对应 token index。
+        """
+        if not masked_patch_indices or source_grid_shape is None:
+            return torch.empty(0, dtype=torch.long)
+
+        token_side = int(math.sqrt(num_tokens))
+        if token_side * token_side != num_tokens:
+            # 理论上 CLIP ViT 的 patch token 都是正方形网格；如果遇到非正方形，
+            # 保守退化为“只保留合法 index”，避免 shape 推断错误导致崩溃。
+            valid = [idx for idx in masked_patch_indices if idx < num_tokens]
+            return torch.tensor(valid, dtype=torch.long)
+
+        source_h, source_w = source_grid_shape
+        # 这个 mask 投影只处理几十/几百个 bool 值，没必要占用 CUDA kernel。
+        # 放在 CPU 上做可以减少 attack loop 中的小 kernel 同步点；如果前面某个大模型
+        # kernel 已经异步失败，也能避免错误被误报到这里的 torch.nonzero。
+        mask_map = torch.zeros((1, 1, source_h, source_w), dtype=torch.float32)
+        for patch_idx in masked_patch_indices:
+            row = patch_idx // source_w
+            col = patch_idx % source_w
+            if 0 <= row < source_h and 0 <= col < source_w:
+                mask_map[:, :, row, col] = 1.0
+
+        token_mask = F.interpolate(mask_map, size=(token_side, token_side), mode="nearest")
+        token_mask = token_mask.view(-1) > 0.5
+        return torch.nonzero(token_mask, as_tuple=False).flatten().long()
+
+    def get_visible_token_indices(self, embedding: Tensor):
+        """返回当前模型中未被共享 mask 覆盖的 token indices。
+
+        semantic OT 和 relation Gram 都只在 visible tokens 上计算，避免 masked token
+        的均值 patch / 零向量参与 Sinkhorn transport 或 Gram 矩阵，导致对齐目标被稀释。
+        """
+        num_tokens = embedding.shape[-2]
+        device = embedding.device
+        if not self.use_random_erasing or not self.current_mask_indices:
+            return torch.arange(num_tokens, dtype=torch.long, device=device)
+
+        masked_token_indices = self.project_mask_indices_to_tokens(
+            self.current_mask_indices,
+            self.current_mask_grid_shape,
+            num_tokens,
+            device,
+        )
+        token_mask = torch.zeros(num_tokens, dtype=torch.bool)
+        if masked_token_indices.numel() > 0:
+            token_mask[masked_token_indices] = True
+        visible_indices = torch.nonzero(~token_mask, as_tuple=False).flatten().long()
+
+        # 极端情况下 top-k 投影后可能覆盖了较小 token grid 的全部位置。
+        # 为了避免空 tensor 让 OT/Sinkhorn 崩掉，这里退回到全 token 对齐。
+        if visible_indices.numel() == 0:
+            visible_indices = torch.arange(num_tokens, dtype=torch.long)
+        return visible_indices.to(device=device, non_blocking=True)
+    
+    @torch.no_grad()
+    def compute_saliency_scores(self, x: Tensor):
+        all_saliency_scores = []
+        batch, channels, height, width = x.shape
+        patch_size = 16
+        target_h, target_w = height // patch_size, width // patch_size 
+        for model in self.extractors:
+            inputs = model.normalizer(x.to(x.device))
+            outputs = model.model.vision_model(pixel_values=inputs, output_attentions=True)
+            patch_importance = self._compute_attention_based_importance(outputs.attentions) 
+            current_num_patches = patch_importance.shape[0]
+            current_side = int(np.sqrt(current_num_patches))
+            importance_2d = patch_importance.view(1, 1, current_side, current_side)
+            rescaled_importance = F.interpolate(importance_2d, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            all_saliency_scores.append(rescaled_importance.view(-1))
+        stacked_scores = torch.stack(all_saliency_scores)
+        avg_saliency = stacked_scores.mean(dim=0)
+        if len(self.extractors) > 1:
+            var_saliency = stacked_scores.var(dim=0, unbiased=False)
+            if var_saliency.max() > var_saliency.min():
+                var_saliency = (var_saliency - var_saliency.min()) / (var_saliency.max() - var_saliency.min())
+        else:
+            var_saliency = torch.zeros_like(avg_saliency)
+        return avg_saliency, var_saliency, target_h, target_w
+
+    def _compute_attention_based_importance(self, attentions):
+        last_attn = attentions[-1]  
+        cls_to_patches = last_attn[:, :, 0, 1:]  
+        avg_attention_received = last_attn[:, :, :, 1:].mean(dim=2)  
+        combined_attention = (cls_to_patches + avg_attention_received) / 2.0  
+        low_attention_threshold = combined_attention.median(dim=2, keepdim=True)[0]  
+        is_low_attention = combined_attention < low_attention_threshold  
+        low_attention_ratio = is_low_attention.float().mean(dim=1).squeeze(0)  
+        importance_scores = 1.0 - low_attention_ratio  
+        avg_attention_magnitude = combined_attention.mean(dim=1).squeeze(0)  
+        if avg_attention_magnitude.max() > avg_attention_magnitude.min():
+            normalized_magnitude = (avg_attention_magnitude - avg_attention_magnitude.min()) / \
+                                 (avg_attention_magnitude.max() - avg_attention_magnitude.min())
+        else:
+            normalized_magnitude = torch.ones_like(avg_attention_magnitude)
+        final_importance = 0.7 * importance_scores + 0.3 * normalized_magnitude
+        return final_importance
+
+    
+
+    def apply_saliency_mask_to_image(self, x: Tensor, patch_size: int = 16):
+        masked_patch_indices, mask_grid_shape = self.select_saliency_mask_indices(x, patch_size=patch_size)
+        if not masked_patch_indices:
+            return x, []
+        x_masked = self.apply_indices_mask_to_image(x, masked_patch_indices, mask_grid_shape)
+        return x_masked, masked_patch_indices
+
+   
+    def reset_attack_state(self):
+        self.ground_truth.clear()
+        self.ground_truth_local.clear()
+        self.ground_truth_attention.clear()
+        self.previous_loss_list.clear()
+        self.previous_loss_local_list.clear()
+        self.current_mask_indices.clear()
+        self.current_mask_grid_shape = None
+        self.step_count = 0
+
+    # 🔥 核心修正 1：计算关系矩阵的函数
+    def compute_relation_matrix(self, embedding: Tensor):
+        """计算特征的 Gram 关系矩阵 R = E E^T / sqrt(d)"""
+        d = embedding.shape[-1]
+        # embedding 形状通常是 (num_tokens, feature_dim)
+        R = torch.matmul(embedding, embedding.transpose(-1, -2)) / math.sqrt(d)
+        return R
+
+    def compute_visible_attention_matrix(self, attention: Tensor, visible_indices: Tensor):
+        """
+        从完整 local-local attention 中裁出当前 shared mask 下的 visible 子矩阵。
+
+        为什么这里还要做一次行归一化：
+        - 原始 self-attention 在完整 token 集上做过 softmax，每一行和约等于 1；
+        - 但我们把 masked token 裁掉之后，保留下来的 visible 子矩阵每一行和会小于 1；
+        - 若不重新归一化，不同 mask ratio 下的数值尺度会漂，attention loss 会混入“可见 token 数量”
+          这个额外因素，而不是纯粹比较关系结构本身。
+        """
+        visible_attention = attention.index_select(0, visible_indices).index_select(1, visible_indices)
+        visible_attention = torch.clamp(visible_attention, min=0.0)
+        visible_attention = visible_attention / (visible_attention.sum(dim=-1, keepdim=True) + 1e-8)
+        return visible_attention
+
+    # ========================================================
 
     @torch.no_grad()
     def set_ground_truth(self, x: Tensor):
         self.ground_truth.clear()
         self.ground_truth_local.clear()
-        self.ground_truth_middle.clear()
-        self.ground_truth_local_middle.clear()
+        self.ground_truth_attention.clear()
+        self.current_mask_indices.clear() # 清除上一轮的记录
+
+        masked_patch_indices = []
+        mask_grid_shape = self._mask_grid_shape(x, patch_size=16)
+        
+        if self.use_random_erasing:
+            if self.use_saliency_mask:
+                masked_patch_indices, mask_grid_shape = self.select_saliency_mask_indices(x, patch_size=16)
+            else:
+                masked_patch_indices, mask_grid_shape = self.sample_patch_mask_indices(x, patch_size=16)
+
+        # 🔥 核心修正 2：
+        # 用 target image 选出本 step 的共享 top-k mask，并保存下来给 adv image 复用。
+        # 同时 target 自己也先做 image-level mask，再提取 f(m(x_t))，对应 Locality Alignment
+        # 里“用 masked image query teacher”的思路。
+        self.current_mask_indices = masked_patch_indices
+        self.current_mask_grid_shape = mask_grid_shape
+        x_masked = self.apply_indices_mask_to_image(x, masked_patch_indices, mask_grid_shape)
+
         for model in self.extractors:
-            x_tensor, x_embedding, x_tensor_middle, cluster_center_middle = model.global_local_middle_features(x.to(x.device))
+            if self.use_attention_alignment:
+                # target 端除了 global/local feature，还额外缓存 masked view 下的 local attention。
+                # 后面 adv 端会在同一个 shared visible token 集上去模仿它。
+                x_tensor, x_embedding, x_attention = model.global_local_attention_features(x_masked.to(x.device))
+            else:
+                x_tensor, x_embedding = model.global_local_features(x_masked.to(x.device))
+                x_attention = None
             x_embedding = x_embedding.squeeze(0)
-            cluster_center = get_cluster_center(x_embedding, self.cluster_number).unsqueeze(0)
+            x_embedding = F.normalize(x_embedding, dim=-1)
             self.ground_truth.append(x_tensor)
-            self.ground_truth_local.append(cluster_center)
+            self.ground_truth_local.append(x_embedding.unsqueeze(0))
+            self.ground_truth_attention.append(None if x_attention is None else x_attention.squeeze(0))
 
-            self.ground_truth_middle.append(x_tensor_middle)
-            self.ground_truth_local_middle.append(cluster_center_middle)
-
-    def __call__(
-        self, feature_dict: Dict[int, Tensor], feature_local_dict: Dict[int, Tensor],
-        feature_middle_dict: Dict[int, Tensor], feature_local_middle_dict: Dict[int, Tensor]
-    ):
-        loss_list = []
-        loss_local_list = []
-        loss_local_middle_list= []
-        loss_middle_list= []
-
-        for index, model in enumerate(self.extractors):
+    def __call__(self, features: List[Tensor], features_local: List[Tensor], features_attention: List[Tensor] = None):
+        total_losses = []
+        
+        for index in range(len(self.extractors)):
+            gt = self.ground_truth[index]
             gt_local = self.ground_truth_local[index].squeeze(0)
-            gt_local_middle = self.ground_truth_local_middle[index].squeeze(0)
-            gt = self.ground_truth[index]
-            gt_middle = self.ground_truth_middle[index]
-            feature = feature_dict[index].unsqueeze(0)
-            feature_local = feature_local_dict[index].squeeze(0)
-            feature_middle = feature_middle_dict[index].unsqueeze(0)
-            feature_local_middle = feature_local_middle_dict[index].squeeze(0)
-
-            local_loss = OT(gt_local, feature_local)
-            feat_loss = OT(gt, feature)
-            local_middle_loss = OT(gt_local_middle, feature_local_middle)
-            feat_middle_loss = OT(gt_middle, feature_middle)
-            loss_list.append(feat_loss)
-            loss_local_list.append(local_loss)
-            loss_local_middle_list.append(local_middle_loss)
-            loss_middle_list.append(feat_middle_loss)
-
-        total_losses = [
-            loss_list[i]
-            + 0.2 * loss_local_list[i]
-            + 0.2 * loss_middle_list[i]
-            + 0.2 * loss_local_middle_list[i]
-            for i in range(len(self.extractors))
-        ]
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
-class EnsembleFeatureExtractor_middle_non_local(BaseFeatureExtractor):
-    def __init__(self, extractors: List[BaseFeatureExtractor], cluster_number=5):
-        super(EnsembleFeatureExtractor_middle_non_local, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.cluster_number = cluster_number
-
-    def forward(self, x: Tensor) -> Tensor:
-        features = {}
-        features_global_random = {}
-
-        for i, model in enumerate(self.extractors):
-            x_tensor, index_tensor = model.global_middle_features(x.to(x.device))
-            features[i] = x_tensor.squeeze()
-
-            features_global_random[i] = index_tensor.squeeze()
-
-        return features, features_global_random
-
-class EnsembleFeatureLoss_OT_dfra_attack_middle_non_local(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor], cluster_number=5):
-        super(EnsembleFeatureLoss_OT_dfra_attack_middle_non_local, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-        self.cluster_number = cluster_number
-        self.ground_truth_middle = []
-        self.ground_truth_local_middle = []
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        self.ground_truth_middle.clear()
-        self.ground_truth_local_middle.clear()
-        for model in self.extractors:
-            x_tensor, x_tensor_middle= model.global_middle_features(x.to(x.device))
-            self.ground_truth.append(x_tensor)
-
-            self.ground_truth_middle.append(x_tensor_middle)
-
-    def __call__(self, feature_dict: Dict[int, Tensor], feature_middle_dict: Dict[int, Tensor]):
-        loss_list = []
-        loss_middle_list= []
-        for index, model in enumerate(self.extractors):
-            gt = self.ground_truth[index]
-            gt_middle = self.ground_truth_middle[index]
-            feature = feature_dict[index].unsqueeze(0)
-            feature_middle = feature_middle_dict[index].unsqueeze(0)
-
-            feat_loss = OT(gt, feature)
-            feat_middle_loss = OT(gt_middle, feature_middle)
-            loss_list.append(feat_loss)
-            loss_middle_list.append(feat_middle_loss)
-
-        total_losses = [
-            loss_list[i]
-            + 0.2 * loss_middle_list[i]
-            for i in range(len(self.extractors))
-        ]
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
-import random
-
-class EnsembleFeatureExtractor_random(BaseFeatureExtractor):
-    def __init__(self, extractors: List[BaseFeatureExtractor],
-        random_layer: List[int], random_index: List[float],
-        index_in_layer: bool=True, cluster_number=5
-    ):
-        super(EnsembleFeatureExtractor_random, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-
-        self.random_layer = random_layer
-        self.random_index = random_index
-        self.index_in_layer = index_in_layer
-        self.cluster_number = cluster_number
-
-        assert len(self.random_layer) == len(self.extractors), "Random layer list length must match extractors length."
-        assert len(self.random_index) == len(self.extractors), "Random index list length must match extractors length."
-
-    def forward(self, x: Tensor):
-        features = []
-        features_local = []
-        features_global_random = []
-        features_local_random = []
-
-        for i, model in enumerate(self.extractors):
-
-            index = self.random_index[i]
-            if self.index_in_layer:
-                index = (self.random_layer[i] + self.random_index[i]) / 3
-
-            global_last, local_last, global_i, local_i = model.global_local_index_features(x, index)
-
-            features.append(global_last.squeeze())
-            cluster_center = get_cluster_center(local_last[0], self.cluster_number).unsqueeze(0)
-            features_local.append(cluster_center)
-
-            features_global_random.append(global_i.squeeze())
-            cluster_random_center = get_cluster_center(local_i[0], self.cluster_number).unsqueeze(0)
-            features_local_random.append(cluster_random_center)
-
-        return features, features_local, features_global_random, features_local_random
-
-class EnsembleFeatureLoss_OT_dfra_attack_random(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor],
-        random_layer: List[int], random_index: List[float],
-        pin_layer: bool=False, pin_index: bool=False, index_in_layer: bool=True,
-        cluster_number=5
-    ):
-        super(EnsembleFeatureLoss_OT_dfra_attack_random, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-        self.ground_truth_random = []
-        self.ground_truth_local_random = []
-
-        self.random_layer = random_layer
-        self.random_index = random_index
-        self.pin_layer = pin_layer
-        self.pin_index = pin_index
-        self.index_in_layer = index_in_layer
-        self.cluster_number = cluster_number
-
-        assert len(self.random_layer) == len(self.extractors), "Random layer list length must match extractors length."
-        assert len(self.random_index) == len(self.extractors), "Random index list length must match extractors length."
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        self.ground_truth_random.clear()
-        self.ground_truth_local_random.clear()
-
-        if not self.pin_layer:
-            random.shuffle(self.random_layer)
-
-        for i, model in enumerate(self.extractors):
-
-            if not self.pin_index:
-                self.random_index[i] = random.random()
             
-            index = self.random_index[i]
-            if self.index_in_layer:
-                index = (self.random_layer[i] + self.random_index[i]) / 3
-
-            x_tensor, x_embedding, x_tensor_i, cluster_center_i = model.global_local_index_features(x.to(x.device), index)
-            x_embedding = x_embedding.squeeze(0)
-            cluster_center = get_cluster_center(x_embedding, self.cluster_number).unsqueeze(0)
-            self.ground_truth.append(x_tensor)
-            self.ground_truth_local.append(cluster_center)
-
-            self.ground_truth_random.append(x_tensor_i)
-            self.ground_truth_local_random.append(cluster_center_i)
-
-    def __call__(self,
-        features: List[Tensor],
-        features_local: List[Tensor],
-        features_random: List[Tensor],
-        features_local_random: List[Tensor]
-    ) -> Tensor:
-        loss_list = []
-        loss_local_list = []
-        loss_local_middle_list= []
-        loss_middle_list= []
-
-        for index, model in enumerate(self.extractors):
-
-            gt_local = self.ground_truth_local[index].squeeze(0)
-            gt_local_middle = self.ground_truth_local_random[index].squeeze(0)
-            gt = self.ground_truth[index]
-            gt_middle = self.ground_truth_random[index]
-
             feature = features[index].unsqueeze(0)
             feature_local = features_local[index].squeeze(0)
-            feature_random = features_random[index].unsqueeze(0)
-            feature_local_random = features_local_random[index].squeeze(0)
 
-            local_loss = OT(gt_local, feature_local)
-            feat_loss = OT(gt,feature)
-            local_middle_loss = OT(gt_local_middle, feature_local_random)
-            feat_middle_loss = OT(gt_middle, feature_random)
-            
-            loss_list.append(feat_loss)
-            loss_local_list.append(local_loss)
-            loss_local_middle_list.append(local_middle_loss)
-            loss_middle_list.append(feat_middle_loss)
+            feature_local = F.normalize(feature_local, dim=-1)
+            gt_local = F.normalize(gt_local, dim=-1)
 
-        total_losses = [
-            loss_list[i]
-            + 0.2 * loss_local_list[i]
-            + 0.2 * loss_middle_list[i]
-            + 0.2 * loss_local_middle_list[i]
-            for i in range(len(self.extractors))
-        ]
+            # 🔥 核心修正 3：
+            # 不同 CLIP 的 token 网格不同，不能直接复用公共 flat index。
+            # 这里先把共享 top-k mask 投影到当前模型 token 网格，再只取 visible tokens。
+            # 这相当于在 token/embedding 层也使用同一个 shared mask，但避免 masked tokens
+            # 参与 OT 和 relation loss。
+            visible_indices = self.get_visible_token_indices(feature_local)
+            feature_local_visible = feature_local.index_select(0, visible_indices)
+            gt_local_visible = gt_local.index_select(0, visible_indices)
 
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
-class EnsembleFeatureExtractor_random_non_local(BaseFeatureExtractor):
-    def __init__(self, extractors: List[BaseFeatureExtractor],
-        random_layer: List[int], random_index: List[float], index_in_layer: bool=True
-    ):
-        super(EnsembleFeatureExtractor_random_non_local, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-
-        self.random_layer = random_layer
-        self.random_index = random_index
-        self.index_in_layer = index_in_layer
-
-        assert len(self.random_layer) == len(self.extractors), "Random layer list length must match extractors length."
-        assert len(self.random_index) == len(self.extractors), "Random index list length must match extractors length."
-
-    def forward(self, x: Tensor) -> Tensor:
-        features = {}
-        features_global_random = {}
-
-        for i, model in enumerate(self.extractors):
-
-            index = self.random_index[i]
-            if self.index_in_layer:
-                index = (self.random_layer[i] + self.random_index[i]) / 3
-
-            x_tensor, index_tensor = model.global_index_features(x.to(x.device), index)
-            features[i] = x_tensor.squeeze()
-            features_global_random[i] = index_tensor.squeeze()
-
-        return features, features_global_random
-
-class EnsembleFeatureExtractor_ot3(BaseFeatureExtractor):
-    def __init__(self, extractors: List[BaseFeatureExtractor]):
-        super(EnsembleFeatureExtractor_ot3, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-
-    def forward(self, x: Tensor) -> Tensor:
-        features = {}
-        features_local = {}
-        for i, model in enumerate(self.extractors):
-            x_tensor, x_embedding = model.global_local_features(x.to(x.device))
-            features[i] = x_tensor.squeeze()
-            cluster_center = get_cluster_center(x_embedding[0], 3).unsqueeze(0)
-            features_local[i]=cluster_center
-
-        return features,features_local
-
-class EnsembleFeatureLoss_OT_dfra_attack_random_non_local(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor],
-        random_layer: List[int], random_index: List[float],
-        pin_layer: bool=False, pin_index: bool=False, index_in_layer: bool=True
-    ):
-        super(EnsembleFeatureLoss_OT_dfra_attack_random_non_local, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-        self.ground_truth_random = []
-        self.ground_truth_local_random = []
-
-        self.random_layer = random_layer
-        self.random_index = random_index
-        self.pin_layer = pin_layer
-        self.pin_index = pin_index
-        self.index_in_layer = index_in_layer
-
-        assert len(self.random_layer) == len(self.extractors), "Random layer list length must match extractors length."
-        assert len(self.random_index) == len(self.extractors), "Random index list length must match extractors length."
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        self.ground_truth_random.clear()
-        self.ground_truth_local_random.clear()
-        
-        if not self.pin_layer:
-            random.shuffle(self.random_layer)
-
-        for i, model in enumerate(self.extractors):
-
-            if not self.pin_index:
-                self.random_index[i] = random.random()
-            
-            index = self.random_index[i]
-            if self.index_in_layer:
-                index = (self.random_layer[i] + self.random_index[i]) / 3
-
-            x_tensor, x_tensor_i = model.global_index_features(x.to(x.device), index)
-            self.ground_truth.append(x_tensor)
-            self.ground_truth_random.append(x_tensor_i)
-
-    def __call__(self, feature_dict: Dict[int, Tensor], feature_middle_dict: Dict[int, Tensor]):
-        loss_list = []
-        loss_middle_list= []
-
-        for index, model in enumerate(self.extractors):
-
-            gt = self.ground_truth[index]
-            gt_middle = self.ground_truth_random[index]
-
-            feature = feature_dict[index].unsqueeze(0)
-            feature_middle = feature_middle_dict[index].unsqueeze(0)
-
+            # 1. 局部内容对齐 (Local Content Alignment via OT)
             feat_loss = OT(gt, feature)
-            feat_middle_loss = OT(gt_middle, feature_middle)
+            semantic_alignment = OT(gt_local_visible, feature_local_visible)
             
-            loss_list.append(feat_loss)
-            loss_middle_list.append(feat_middle_loss)
+            # 🔥 核心修正 4：局部关系对齐 (Local Relational Alignment via MSE)
+            R_gt = self.compute_relation_matrix(gt_local_visible)
+            R_adv = self.compute_relation_matrix(feature_local_visible)
+            relational_alignment = -F.mse_loss(R_adv, R_gt)
 
-        total_losses = [
-            loss_list[i]
-            + 0.2 * loss_middle_list[i]
-            for i in range(len(self.extractors))
-        ]
+            # 新增：attention relation alignment。
+            # 这里对齐的不是“token feature 本身”，而是“每个局部区域如何关注其他局部区域”的分布。
+            # 它和上面的 Gram relation 是互补关系：
+            # - Gram 更像静态相似性拓扑；
+            # - Attention 更像 transformer 内部的动态依赖模式。
+            attention_alignment = feature_local_visible.new_tensor(0.0)
+            if self.use_attention_alignment and features_attention is not None:
+                gt_attention = self.ground_truth_attention[index]
+                feature_attention = features_attention[index]
+                if gt_attention is not None and feature_attention is not None:
+                    gt_attention = gt_attention.squeeze(0) if gt_attention.dim() == 3 else gt_attention
+                    feature_attention = feature_attention.squeeze(0) if feature_attention.dim() == 3 else feature_attention
 
+                    gt_attention_visible = self.compute_visible_attention_matrix(gt_attention, visible_indices)
+                    feature_attention_visible = self.compute_visible_attention_matrix(feature_attention, visible_indices)
+
+                    # 当前 attack 的整体目标是“最大化总 score”；
+                    # 因此 attention 这类距离项要取负号，表示“距离越小，score 越大”。
+                    attention_alignment = -F.mse_loss(feature_attention_visible, gt_attention_visible)
+
+            total_loss_i = (
+                feat_loss
+                + self.lambda_sem * semantic_alignment
+                + self.lambda_rel * relational_alignment
+                + self.lambda_attn * attention_alignment
+            )
+            total_losses.append(total_loss_i)
+        
         if len(self.previous_loss_list) == 0:
             self.previous_loss_list = [l.detach() for l in total_losses]
 
         weights = []
         for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
+            raw_ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
+            ratio = max(0.2, min(5.0, raw_ratio))
             weights.append(ratio)
+
+        T = max(self.T_min, self.T_init * (self.decay_rate ** self.step_count))
+        self.step_count += 1
         
-        T = 1.0
         K = len(weights)
         weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
+        
+        weights_np_shifted = weights_np - np.max(weights_np)
+        weights_softmax = np.exp(weights_np_shifted / T)
         weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
+        weights_softmax *= K 
 
         for i in range(len(self.extractors)):
             self.previous_loss_list[i] = total_losses[i].detach()
@@ -938,163 +773,4 @@ class EnsembleFeatureLoss_OT_dfra_attack_random_non_local(nn.Module):
             weights_softmax[i] * total_losses[i]
             for i in range(len(self.extractors))
         )
-        return total_loss
-
-class EnsembleFeatureLoss_OT_ablation_wo_global(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor], cluster_number=5):
-        super(EnsembleFeatureLoss_OT_ablation_wo_global, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-        self.cluster_number = cluster_number
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        for model in self.extractors:
-            x_tensor, x_embedding = model.global_local_features(x.to(x.device))
-            x_embedding = x_embedding.squeeze(0)
-            cluster_center = get_cluster_center(x_embedding, self.cluster_number).unsqueeze(0)
-            self.ground_truth.append(x_tensor)
-            self.ground_truth_local.append(cluster_center)
-
-    def __call__(self, feature_dict: Dict[int, Tensor], feature_local_dict: Dict[int, Tensor]):
-        loss_list = []
-        loss_local_list = []
-        for index, model in enumerate(self.extractors):
-            gt_local = self.ground_truth_local[index].squeeze(0)
-            gt = self.ground_truth[index]
-            feature = feature_dict[index]
-            feature_local = feature_local_dict[index].squeeze(0)
-            local_loss = OT(gt_local, feature_local)
-            feat_loss = torch.mean(torch.sum(feature * gt, dim=1))
-
-            loss_list.append(feat_loss)
-            loss_local_list.append(local_loss)
-
-        total_losses = [
-            loss_list[i] + 0.2 * loss_local_list[i]
-            for i in range(len(self.extractors))
-        ]
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
-class EnsembleFeatureLoss_OT_ablation_wo_local(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor], cluster_number=5):
-        super(EnsembleFeatureLoss_OT_ablation_wo_local, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-        self.cluster_number = cluster_number
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        for model in self.extractors:
-            x_tensor, x_embedding = model.global_local_features(x.to(x.device))
-            x_embedding = x_embedding.squeeze(0)
-            cluster_center = get_cluster_center(x_embedding, self.cluster_number).unsqueeze(0)
-            self.ground_truth.append(x_tensor)
-            self.ground_truth_local.append(cluster_center)
-
-    def __call__(self, feature_dict: Dict[int, Tensor]):
-        loss_list = []
-        for index, model in enumerate(self.extractors):
-            gt = self.ground_truth[index]
-            feature = feature_dict[index].unsqueeze(0)
-
-            feat_loss = OT(gt, feature)
-            loss_list.append(feat_loss)
-
-        total_losses = [
-            loss_list[i]
-            for i in range(len(self.extractors))
-        ]
-        if len(self.previous_loss_list) == 0:
-            self.previous_loss_list = [l.detach() for l in total_losses]
-
-        weights = []
-        for i in range(len(self.extractors)):
-            ratio = total_losses[i].item() / (self.previous_loss_list[i].item() + 1e-8)
-            weights.append(ratio)
-        
-        T = 1.0
-        K = len(weights)
-        weights_np = np.array(weights)
-        weights_softmax = np.exp(weights_np / T)
-        weights_softmax /= np.sum(weights_softmax)
-        weights_softmax *= K
-
-        for i in range(len(self.extractors)):
-            self.previous_loss_list[i] = total_losses[i].detach()
-
-        total_loss = sum(
-            weights_softmax[i] * total_losses[i]
-            for i in range(len(self.extractors))
-        )
-        return total_loss
-
-class EnsembleFeatureLoss_OT_ablation_wo_dynamic(nn.Module):
-    def __init__(self, extractors: List[BaseFeatureExtractor], cluster_number=5):
-        super(EnsembleFeatureLoss_OT_ablation_wo_dynamic, self).__init__()
-        self.extractors = nn.ModuleList(extractors)
-        self.ground_truth = []
-        self.ground_truth_local = []
-        self.previous_loss_list=[]
-        self.previous_loss_local_list = []
-        self.cluster_number = cluster_number
-
-    @torch.no_grad()
-    def set_ground_truth(self, x: Tensor):
-        self.ground_truth.clear()
-        self.ground_truth_local.clear()
-        for model in self.extractors:
-            x_tensor, x_embedding = model.global_local_features(x.to(x.device))
-            x_embedding = x_embedding.squeeze(0)
-            cluster_center = get_cluster_center(x_embedding, self.cluster_number).unsqueeze(0)
-            self.ground_truth.append(x_tensor)
-            self.ground_truth_local.append(cluster_center)
-
-    def __call__(self, feature_dict: Dict[int, Tensor]):
-        loss_list = []
-        for index, model in enumerate(self.extractors):
-            gt = self.ground_truth[index]
-            feature = feature_dict[index].unsqueeze(0)
-
-            feat_loss = OT(gt, feature)
-            loss_list.append(feat_loss)
-
-        total_losses = [
-            loss_list[i]
-            for i in range(len(self.extractors))
-        ]
-
-        total_loss = sum(total_losses)/len(total_losses)
         return total_loss
