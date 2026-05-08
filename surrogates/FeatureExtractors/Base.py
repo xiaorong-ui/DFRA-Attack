@@ -136,14 +136,8 @@ class EnsembleFeatureExtractor_ot(BaseFeatureExtractor):
         features_local = []
         features_attention = []
         for model in self.extractors:
-            # 这里把 attention 一起取出来，是为了把“区域间谁关注谁”的关系
-            # 也纳入对齐目标，而不仅仅是 patch feature 本身的 Gram 关系。
             global_feature, local_feature, local_attention = model.global_local_attention_features(x)
             features.append(global_feature.squeeze())
-            # 🔥 1. 注释掉 K-means 聚类
-            # cluster_center = get_cluster_center(local_feature[0], self.cluster_number).unsqueeze(0)
-            # features_local.append(cluster_center)
-            # 🔥 2. 直接将完整的 196 个 Token 存入列表
             features_local.append(local_feature[0].unsqueeze(0))
             features_attention.append(local_attention[0].unsqueeze(0))
         return features, features_local, features_attention
@@ -187,17 +181,6 @@ class EnsembleFeatureLoss_OT(nn.Module):
 # 全局最优传输 (Optimal Transport) 距离计算函数
 # ========================================================
 def Sinkhorn(K, u, v):
-    # 这里给 Sinkhorn 补上数值稳定性保护。
-    # 之前直接做除法：
-    #   r = u / (K @ c)
-    #   c = v / (K^T @ r)
-    # 当某一行/列的和非常接近 0 时，容易产生 inf / nan；
-    # CUDA 往往不会在出问题的那一行立刻报错，而是异步地在后续某个 `.item()` /
-    # matmul / reduction 位置抛出 "unspecified launch failure"。
-    # 因此这里统一：
-    # 1) 分母 clamp_min；
-    # 2) 迭代中检查有限性；
-    # 3) 若 transport plan 非法，返回 None 让上层兜底。
     r = torch.ones_like(u, dtype=torch.float32)
     c = torch.ones_like(v, dtype=torch.float32)
     K = K.to(dtype=torch.float32)
@@ -230,12 +213,6 @@ def Sinkhorn(K, u, v):
     return T
 
 def OT(src_dis, tgt_dis):
-    # 这里的 OT 既要给 attack 提供可反传的相似性分数，又不能因为极端输入把整轮攻击炸掉。
-    # 因此做几层保护：
-    # 1) 空 tensor 直接返回 0；
-    # 2) 内部统一用 float32 计算 transport plan，降低数值抖动；
-    # 3) 只让 `sim` 参与梯度，Sinkhorn plan `T` 仍然保持 no_grad；
-    # 4) 一旦发现非有限值，就返回 0 分而不是把整个 job 打崩。
     if src_dis is None or tgt_dis is None:
         device = None
         if isinstance(src_dis, torch.Tensor):
@@ -294,13 +271,6 @@ def OT(src_dis, tgt_dis):
 
 import math
 class EnsembleFeatureLoss_OT_dfra_attack(nn.Module):
-    # 这里将 erasing_prob 保持为 1.0：
-    # - 当前方法使用的是“shared top-k saliency mask”，不是普通随机擦除；
-    # - 如果每个 step 只偶尔启用 mask，会让优化目标在 masked / unmasked 视图之间来回切换，
-    #   不利于稳定地学习局部对齐。
-    # 同时把默认 erasing_scale 调低到 0.12：
-    # - 因为当前 mask 的是三个 CLIP 共同最关注的区域，破坏力比随机遮挡更强；
-    # - 0.12 在 14x14 公共网格上大约对应 24 个 patch，通常比 0.15 更稳妥。
     def __init__(
         self,
         extractors,
